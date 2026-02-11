@@ -1,5 +1,5 @@
 # MultiWiSE Canada Dashboard
-# Updated Nov 13, 2025
+# Updated Feb 10, 2026
 
 #### Configuration and setup ####
 options(shiny.maxRequestSize = 5000e6)  # NOTE: Using 5 GB upload cap for dashboard to run locally
@@ -56,8 +56,8 @@ resolve_token_path <- function() {
 
 # ---- Hard cap for upload size and number individuals able to be processed (server-side enforcement to match 250 MB) ----
 # MAX_UPLOAD_BYTES <- 250e6 # NOTE: No upload cap for running dashboard locally
-# --- UPDATED: resolve max IDs from option/env to avoid any ambiguity with 5e5L ---
-# MAX_UNIQUE_INDIVIDUALS <- as.integer(getOption(  # NOTE: No individuals cap for running dashboard locally
+# # --- UPDATED: resolve max IDs from option/env to avoid any ambiguity with 5e5L ---
+# MAX_UNIQUE_INDIVIDUALS <- as.integer(getOption( # NOTE: No individuals cap for running dashboard locally
 #   "multiwise.max_ids",
 #   Sys.getenv("MW_MAX_IDS", "500000")
 # ))
@@ -348,7 +348,7 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     overlap_end   <- min(pc_end,   exposure_window_end)
     if (overlap_end < overlap_start) next
     
-    dt <- fn_get_postal_code_data(pc, token_path = dropbox_token_file)
+    dt <- fn_get_postal_code_data(pc)#, token_path = dropbox_token_file)
     
     dt[, c("epiweek_start_date","epiweek_end_date") :=
          lapply(.SD, as.Date), .SDcols = c("epiweek_start_date","epiweek_end_date")]
@@ -364,12 +364,15 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     dt[, days_overlap     := ifelse(days_overlap < 7, days_overlap, n_days)]
     dt[, fraction_of_week := days_overlap / n_days]
     dt[, partial_pm25_weekly_sum := pm25_weekly_sum * fraction_of_week]
+    dt[, partial_non_wfs_weekly_sum_pm25 := non_wfs_weekly_sum_pm25 * fraction_of_week]
     dt[, partial_n_days          := n_days * fraction_of_week]
+    dt[, partial_counterfactual          :=  unique(dt[dt$wfs_weekly_sum_pm25 > 0,]$non_wfs_weekly_avg_pm25) * fraction_of_week]
     
     pw_list[[ctr]] <- dt[, .(
       epiweek_index, epiweek_start_date, epiweek_end_date,
-      partial_pm25_weekly_sum, pm25_weekly_avg,
-      partial_n_days, PostalCode
+      partial_pm25_weekly_sum,
+      partial_non_wfs_weekly_sum_pm25,
+      partial_n_days, partial_counterfactual, PostalCode
     )]
     ctr <- ctr + 1L
   }
@@ -380,11 +383,19 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   
   weekly_exposure <- combine_partial[, .(
     weekly_pm25_sum_i = sum(partial_pm25_weekly_sum, na.rm = TRUE),
+    weekly_non_wfs_pm25_sum_i = sum(partial_non_wfs_weekly_sum_pm25, na.rm = TRUE),
+    counterfactual = sum(partial_counterfactual, na.rm = TRUE),
     n_days            = sum(partial_n_days,          na.rm = TRUE),
-    PostalCode        = PostalCode[which.max(partial_n_days)]
+    PostalCode        = PostalCode[which.max(partial_n_days)],
+    num_PCs        = uniqueN(PostalCode)
   ), by = .(epiweek_index, epiweek_start_date, epiweek_end_date)][order(epiweek_start_date)]
   
   weekly_exposure[, weekly_pm25_avg_i := weekly_pm25_sum_i / n_days]
+  weekly_exposure[, weekly_non_wfs_pm25_avg_i := weekly_non_wfs_pm25_sum_i / n_days]
+  weekly_exposure[, weekly_wfs_pm25_sum_i := weekly_pm25_sum_i - weekly_non_wfs_pm25_sum_i]
+  weekly_exposure[, weekly_wfs_pm25_avg_i := weekly_pm25_avg_i - weekly_non_wfs_pm25_avg_i]
+  weekly_exposure[, is_smoke_impacted := ifelse(weekly_wfs_pm25_avg_i > 0, 1, 0)]
+  
   weekly_exposure <- weekly_exposure[n_days > 0]
   
   if (nrow(weekly_exposure) > 0 && weekly_exposure$n_days[1] < 7)
@@ -398,6 +409,11 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     warning("Warning: No overlapping data found for this individual's history.", call. = FALSE)
     weekly_exposure[, week_sequence := integer()]
   }
+  
+  weekly_exposure <- weekly_exposure[order(week_sequence)]
+  weekly_exposure[, cumulative_wfs_pm25_sum_individual := cumsum(weekly_wfs_pm25_sum_i)]
+  weekly_exposure[, cumulative_non_wfs_pm25_sum_individual := cumsum(weekly_non_wfs_pm25_sum_i)]
+  weekly_exposure[, cumulative_total_pm25_sum_individual := cumsum(weekly_pm25_sum_i)]
   
   return(weekly_exposure[])
 }
@@ -428,6 +444,10 @@ province_lookup <- data.frame(
     'Ontario','Manitoba','Saskatchewan','Alberta','BritishColumbia',
     'NorthwestTerritories-Nunavut','Yukon'
   ),
+  provinceID = c('NL', 'NS', 'PE', 'NB', 
+                 'QC', 'QC', 'QC', 'ON', 'ON', 'ON', 'ON',
+                 'ON', 'MB', 'SK', 'AB', 'BC',
+                 'NT-NU', 'YT'),
   stringsAsFactors = FALSE
 )
 province_abbr <- c(
@@ -459,12 +479,12 @@ fn_get_postal_code_data <- function(postal_code,
   prefix <- toupper(substr(postal_code, 1, 1))
   info   <- subset(province_lookup, start_pc == prefix)
   if (!nrow(info)) stop(postal_code_error(postal_code), call. = FALSE)
-  province_folder <- info$province
-  abbr <- province_abbr[[province_folder]]
+  province_folder <- info$provinceID
+  abbr <- province_abbr[[info$province]]
   if (is.null(abbr)) stop(postal_code_error(postal_code), call. = FALSE)
   
-  filename     <- paste0(abbr, "_PC_CanOSSEM_weekly_pm25_", postal_code, "_all_yrs.RDS")
-  dropbox_path <- file.path("CanOSSEM_PostalCode_Weekly_2010-2023", province_folder, filename)
+  filename     <- paste0(abbr, "_PC_CanOSSEM_weekly_wfs_pm25_", postal_code, "_all_yrs.RDS")
+  dropbox_path <- file.path("CanOSSEM_PC_Weekly_WFS_PM25_2010-2023", province_folder, filename)
   local_file   <- file.path(local_dir, filename)
   
   if (!file.exists(local_file) || overwrite) {
@@ -487,12 +507,11 @@ fn_get_postal_code_data <- function(postal_code,
     else stop("File lacks epiweek index", call. = FALSE)
   }
   
-  dt <- dt[, .(
-    pm25_weekly_sum = sum(pm25_weekly_sum, na.rm = TRUE),
-    pm25_weekly_avg = sum(pm25_weekly_avg * n_days, na.rm = TRUE) / sum(n_days, na.rm = TRUE),
-    n_days          = sum(n_days, na.rm = TRUE),
-    PostalCode      = first(PostalCode)
-  ), by = .(epiweek_index, epiweek_start_date, epiweek_end_date)][]
+  if(nrow(dt) != uniqueN(dt$epiweek_start_date) || nrow(dt) != uniqueN(dt$epiweek_index)) {
+    stop(paste0("We ran into issues when accessing the data for postal code: ", postal_code, ". Please contact us to let us know this issue occurred and we will do our best to address the issue as soon as possible."),
+         call. = FALSE)
+  }
+  
   dt
 }
 
@@ -504,40 +523,7 @@ fn_calc_modified_z <- function(x) {
   (x - med) / madv
 }
 
-#### 7  Counterfactual trajectory builder #####################################
-fn_build_counterfactual_trajectory <- function(df) {
-  df <- data.table::copy(df)[order(week_sequence)]
-  
-  df[, cumulative_total_pm25_sum_individual := cumsum(weekly_pm25_sum_i)]
-  df[, modified_z := fn_calc_modified_z(weekly_pm25_sum_i)]
-  df[, start_date := epiweek_start_date]
-  
-  df[, wildfire_season :=
-       (lubridate::month(epiweek_end_date)   >= 5 &
-          lubridate::month(epiweek_start_date) <= 10)]
-  
-  counterfactual_slope <- df[
-    !is.na(modified_z) & modified_z >= -2 & modified_z <= 2 & n_days == 7,
-    median(weekly_pm25_sum_i, na.rm = TRUE)
-  ]
-  if (!is.finite(counterfactual_slope)) counterfactual_slope <- 0
-  
-  df[, weekly_non_wfs_pm25_sum_i := ifelse(
-    modified_z > 2 & wildfire_season,
-    counterfactual_slope,
-    weekly_pm25_sum_i
-  )]
-  
-  df[, cumulative_non_wfs_pm25_sum_individual := cumsum(weekly_non_wfs_pm25_sum_i)]
-  df[, weekly_wfs_pm25_sum_i := weekly_pm25_sum_i - weekly_non_wfs_pm25_sum_i]
-  df[, cumulative_wfs_pm25_sum_individual := cumsum(weekly_wfs_pm25_sum_i)]
-  df[, weekly_non_wfs_pm25_avg_i := weekly_non_wfs_pm25_sum_i / n_days]
-  df[, weekly_wfs_pm25_avg_i     := weekly_wfs_pm25_sum_i     / n_days]
-  
-  df[]
-}
-
-#### 8  Identify smoke episodes ###############################################
+#### 7  Identify smoke episodes ###############################################
 fn_identify_smoke_episodes <- function(is_smoke_impacted, cont_week,
                                        weekly_sum_wfs_pm25_values,
                                        episode_threshold = 0,
@@ -587,7 +573,7 @@ fn_identify_smoke_episodes <- function(is_smoke_impacted, cont_week,
   epi_id
 }
 
-#### 9  Compute metrics ########################################################
+#### 8  Compute metrics ########################################################
 fn_compute_metrics <- function(df,
                                exposure_start,
                                exposure_end,
@@ -629,7 +615,7 @@ fn_compute_metrics <- function(df,
   
   obs_cumul_mg <- dplyr::last(df$cumulative_total_pm25_sum_individual) * MICRO_TO_MILLI
   wfs_cumul_mg <- dplyr::last(df$cumulative_wfs_pm25_sum_individual)   * MICRO_TO_MILLI
-  cf_cumul_mg  <- sum(df$weekly_non_wfs_pm25_sum_i, na.rm = TRUE) * MICRO_TO_MILLI
+  non_wfs_cumul_mg  <- sum(df$weekly_non_wfs_pm25_sum_i, na.rm = TRUE) * MICRO_TO_MILLI
   
   pct_wfs_from_severe <- if (wfs_cumul_mg > 0)
     100 * severe_pm25_cum * MICRO_TO_MILLI / wfs_cumul_mg else NA_real_
@@ -667,15 +653,15 @@ fn_compute_metrics <- function(df,
   extras <- tibble::tibble(
     `Cumulative_Total_PM25`     = round(obs_cumul_mg, 2),
     `Average_Total_PM25`        = round(mean(df$weekly_pm25_avg_i, na.rm = TRUE), 2),
-    `Cumulative_NonWFS_PM25`    = round(cf_cumul_mg, 2),
+    `Cumulative_NonWFS_PM25`    = round(non_wfs_cumul_mg, 2),
     `Average_NonWFS_PM25`       = round(mean(df$weekly_non_wfs_pm25_avg_i, na.rm = TRUE), 2),
-    `Counterfactual_Value`      = round(unique(df$weekly_non_wfs_pm25_avg_i[df$is_smoke_impacted == 1]), 2)
+    `Average_Counterfactual_Value` = round(mean(unique(df[df$num_PCs == 1,]$counterfactual)), 2)
   )
   
   dplyr::bind_cols(numbered, extras)
 }
 
-#### 10  Plotting functions ####################################################
+#### 9  Plotting functions ####################################################
 median_range_color        <- "#B0C6DF"
 wildfire_attributable_col <- "#FF8572"
 
@@ -689,7 +675,7 @@ fn_plot_cumulative_sum_by_year <- function(df, y_limits = NULL, line_thin = PLOT
     max(c(df_plot$total, df_plot$non_wfs, df_plot$wfs), na.rm = TRUE) * 1.20
   else y_limits[2]
   
-  ggplot2::ggplot(df_plot, ggplot2::aes(x = start_date)) +
+  ggplot2::ggplot(df_plot, ggplot2::aes(x = epiweek_start_date)) +
     ggplot2::geom_line(ggplot2::aes(y = total,   color = "Total"),   linewidth = 1) +
     ggplot2::geom_line(ggplot2::aes(y = non_wfs, color = "Non-WFS"), linewidth = 1) +
     ggplot2::geom_line(ggplot2::aes(y = wfs,     color = "WFS"),     linewidth = 1) +
@@ -700,7 +686,7 @@ fn_plot_cumulative_sum_by_year <- function(df, y_limits = NULL, line_thin = PLOT
     ), breaks = c("Total","Non-WFS","WFS"), name = NULL) +
     ggplot2::scale_x_date(date_breaks = "1 year", date_labels = "%Y", expand = c(0, 0)) +
     ggplot2::scale_y_continuous(expand = c(0, 0), limits = c(0, y_max)) +
-    ggplot2::labs(title = "A", x = "Year",
+    ggplot2::labs(x = "Year",
                   y = expression("Cumulative PM"[2.5]*" (mg/m"^3*")")) +
     ggplot2::theme_classic(base_size = PLOT_BASE_SIZE) +
     ggplot2::theme(
@@ -732,29 +718,29 @@ fn_plot_time_series_weekly_mean <- function(df, y_limits = NULL,
   
   if(sum(df_plot$episode_id > 0)) {
     epi_spans <- df_plot %>% dplyr::filter(episode_id > 0) %>% dplyr::group_by(episode_id) %>%
-      dplyr::summarise(start = min(start_date, na.rm = TRUE),
+      dplyr::summarise(start = min(epiweek_start_date, na.rm = TRUE),
                        end   = max(epiweek_end_date, na.rm = TRUE), .groups = "drop")
     
     plot <- plot + ggplot2::geom_rect(data = epi_spans, inherit.aes = FALSE,
-                                      ggplot2::aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf,
+                                      ggplot2::aes(xmin = start-3, xmax = end+3, ymin = -Inf, ymax = Inf,
                                                    fill = "Episode"), alpha = alpha_norm) 
   }
   if(sum(df_plot$severe_episode_id > 0)) {
     sev_spans <- df_plot %>% dplyr::filter(severe_episode_id > 0) %>% dplyr::group_by(severe_episode_id) %>%
-      dplyr::summarise(start = min(start_date, na.rm = TRUE),
+      dplyr::summarise(start = min(epiweek_start_date, na.rm = TRUE),
                        end   = max(epiweek_end_date, na.rm = TRUE), .groups = "drop")
     
     plot <- plot + ggplot2::geom_rect(data = sev_spans, inherit.aes = FALSE,
-                                      ggplot2::aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf,
+                                      ggplot2::aes(xmin = start-3, xmax = end+3, ymin = -Inf, ymax = Inf,
                                                    fill = "Severe episode"), alpha = alpha_severe)
   }
   plot <- plot +
     ggplot2::geom_line(data = df_plot,
-                       ggplot2::aes(x = start_date, y = total,   color = "Total"),   linewidth = 0.9) +
+                       ggplot2::aes(x = epiweek_start_date, y = total,   color = "Total"),   linewidth = 0.9) +
     ggplot2::geom_line(data = df_plot,
-                       ggplot2::aes(x = start_date, y = non_wfs, color = "Non-WFS"), linewidth = 0.9) +
+                       ggplot2::aes(x = epiweek_start_date, y = non_wfs, color = "Non-WFS"), linewidth = 0.9) +
     ggplot2::geom_line(data = df_plot,
-                       ggplot2::aes(x = start_date, y = wfs,     color = "WFS"),     linewidth = 0.9) 
+                       ggplot2::aes(x = epiweek_start_date, y = wfs,     color = "WFS"),     linewidth = 0.9) 
   
   if (sum(df_plot$severe_episode_id > 0) || sum(df_plot$episode_id > 0)) {
     plot <- plot + ggplot2::scale_fill_manual(values = c("Episode" = "orange", "Severe episode" = "red3"),
@@ -772,7 +758,7 @@ fn_plot_time_series_weekly_mean <- function(df, y_limits = NULL,
     guide  = ggplot2::guide_legend(override.aes = list(fill = NA, linewidth = 1.5))) +
     ggplot2::scale_x_date(date_breaks = "1 year", date_labels = "%Y", expand = c(0, 0)) +
     ggplot2::scale_y_continuous(expand = c(0, 0), limits = c(0, y_max)) +
-    ggplot2::labs(title = "B", x = "Year",
+    ggplot2::labs(x = "Year",
                   y = expression("Mean PM"[2.5]*" ("*mu*"g/m"^3*")")) +
     ggplot2::theme_classic(base_size = PLOT_BASE_SIZE) +
     ggplot2::theme(
@@ -783,76 +769,21 @@ fn_plot_time_series_weekly_mean <- function(df, y_limits = NULL,
     )
 }
 
-fn_plot_histogram <- function(df, binwidth = 8, line_thin = PLOT_LINE_THIN) {
-  slopes <- df$weekly_pm25_sum_i
-  z_vals <- df$modified_z
-  counterfactual <- median(df[df$modified_z >= -2 & df$modified_z <= 2,]$weekly_pm25_sum_i, na.rm = TRUE)
-  stable_idx <- which(!is.na(z_vals) & z_vals >= -2 & z_vals <= 2)
-  min_slope  <- if (length(stable_idx)) min(slopes[stable_idx]) else NA_real_
-  max_slope  <- if (length(stable_idx)) max(slopes[stable_idx]) else NA_real_
-  
-  tmp_hist <- ggplot2::ggplot_build(
-    ggplot2::ggplot(df, ggplot2::aes(x = weekly_pm25_sum_i)) +
-      ggplot2::geom_histogram(binwidth = binwidth, boundary = 0, na.rm = TRUE)
-  )
-  y_max_count <- max(tmp_hist$data[[1]]$count, na.rm = TRUE) * 1.10
-  rect_df <- data.frame(xmin = min_slope, xmax = max_slope,
-                        ymin = 0, ymax = y_max_count)
-  
-  x_max <- max(slopes, na.rm = TRUE) * 1.05
-  
-  ggplot2::ggplot() +
-    ggplot2::geom_rect(data = rect_df,
-                       ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
-                                    fill = "-2 < Z-Score < 2"), alpha = 0.3) +
-    ggplot2::geom_histogram(data = df,
-                            ggplot2::aes(x = weekly_pm25_sum_i),
-                            binwidth = binwidth, boundary = 0,
-                            fill = "grey90", color = "black",
-                            linewidth = line_thin, show.legend = FALSE,
-                            na.rm = TRUE) +
-    { if (!is.na(min_slope))
-      ggplot2::geom_vline(xintercept = min_slope, linetype = "dashed",
-                          linewidth = line_thin) } +
-    { if (!is.na(max_slope))
-      ggplot2::geom_vline(xintercept = max_slope, linetype = "dashed",
-                          linewidth = line_thin) } +
-    ggplot2::geom_vline(ggplot2::aes(xintercept = counterfactual,
-                                     color = "Counterfactual"), linewidth = 1.2) +
-    ggplot2::scale_fill_manual(values = c("-2 < Z-Score < 2" = "yellow"), name = NULL) +
-    ggplot2::scale_color_manual(values = c("Counterfactual" = "#0085E4"), name = NULL) +
-    ggplot2::guides(fill = ggplot2::guide_legend(order = 1),
-                    color = ggplot2::guide_legend(order = 2)) +
-    ggplot2::scale_x_continuous(limits = c(0, x_max), expand = c(0, 0)) +
-    ggplot2::scale_y_continuous(limits = c(0, y_max_count), expand = c(0, 0)) +
-    ggplot2::labs(title = "C",
-                  x = expression("Weekly Sum of PM"[2.5]*" ("*mu*"g/m"^3*" per epi-week)"),
-                  y = "Count") +
-    ggplot2::theme_classic(base_size = PLOT_BASE_SIZE) +
-    ggplot2::theme(
-      legend.position = "top",
-      axis.line  = ggplot2::element_line(linewidth = line_thin),
-      axis.ticks = ggplot2::element_line(linewidth = line_thin),
-      plot.title = ggplot2::element_text(hjust = 0),
-      panel.grid = ggplot2::element_blank()
-    )
-}
-
-#### 11  Run individual analysis ##############################################
+#### 10  Run individual analysis ##############################################
 fn_run_individual_analysis <- function(res_hist,
                                        start_exposure,
                                        end_exposure,
                                        token_path,
                                        IndividualID) {
   
-  weekly_exposure <- fn_build_individual_exposure_history(
+  trajectory <- fn_build_individual_exposure_history(
     residential_history_table = res_hist,
     exposure_window_start     = start_exposure,
     exposure_window_end       = end_exposure,
     dropbox_token_file        = token_path
   )
   
-  trajectory <- fn_build_counterfactual_trajectory(weekly_exposure)
+  # trajectory <- fn_build_counterfactual_trajectory(weekly_exposure)
   
   trajectory[, episode_id := fn_identify_smoke_episodes(
     is_smoke_impacted          = as.integer(weekly_wfs_pm25_avg_i > 0),
@@ -902,7 +833,7 @@ fn_run_individual_analysis <- function(res_hist,
        data = trajectory)
 }
 
-#### 11.5  Single-ID runner (handles repeated/duplicate windows) ##############
+#### 11  Single-ID runner (handles repeated/duplicate windows) ##############
 fn_single <- function(d, token_path) {
   id <- unique(d$IndividualID)
   
@@ -933,7 +864,7 @@ fn_single <- function(d, token_path) {
   )
 }
 
-#### 13  Output helpers ########################################################
+#### 12  Output helpers ########################################################
 sanitize_names <- function(x) {
   x %>%
     stringi::stri_trans_general("Latin-ASCII") %>%
@@ -987,7 +918,6 @@ save_batch_outputs <- function(batch, out_dir_root) {
       data.table::setnames(long_weekly, old, rename_map[[old]])
     }
   }
-  
   cols_keep <- c(
     "IndividualID", "PostalCode", "epiweek_index", "n_days",
     "epiweek_start_date", "epiweek_end_date",
@@ -1174,7 +1104,7 @@ theme <- bslib::bs_add_rules(theme, "
   }
 ")
 
-# --- ADDED: Re-enable the default Shiny upload progress bars (override the hide) ---
+# --- Re-enable the default Shiny upload progress bars (override the hide) ---
 theme <- bslib::bs_add_rules(theme, "
   /* Re-enable default Shiny file upload progress bars */
   #res_file_progress, #exp_file_progress,
@@ -1183,7 +1113,7 @@ theme <- bslib::bs_add_rules(theme, "
   }
 ")
 
-# --- ADDED: Floating upload-busy pop-up styles ---
+# --- Floating upload-busy pop-up styles ---
 theme <- bslib::bs_add_rules(theme, "
   #upload_busy {
     position: fixed;
@@ -1408,10 +1338,10 @@ ui <- navbarPage(
                                    "profile_type", "Profile", inline = TRUE,
                                    choiceNames = list(
                                      "Cumulative Exposure",
-                                     "Weekly Average Exposure",
-                                     HTML("Distribution of Weekly Sum of Total PM<sub>2.5</sub>")
+                                     "Weekly Average Exposure"#,
+                                     #HTML("Distribution of Weekly Sum of Total PM<sub>2.5</sub>")
                                    ),
-                                   choiceValues = list("cumulative", "weekly_avg", "counterfactual_hist"),
+                                   choiceValues = list("cumulative", "weekly_avg"),#, "counterfactual_hist"),
                                    selected = "cumulative"
                                  ),
                                  uiOutput("id_selector_ui")
@@ -1435,7 +1365,7 @@ ui <- navbarPage(
         )
       ),
       
-      # --- ADDED: floating upload indicator (bottom-right) ---
+      # --- floating upload indicator (bottom-right) ---
       tags$div(
         id = "upload_busy",
         class = "card shadow-sm",
@@ -1464,7 +1394,7 @@ ui <- navbarPage(
           width = 9,
           tags$h4(HTML("<b>About the Dashboard</b>")),
           HTML("
-<p>This dashboard uses information on individual-level residential histories and defined exposure windows to generate weekly estimates of wildfire smoke (WFS) PM<sub>2.5</sub> and calculate the 12 Multiyear Wildfire Smoke Exposure (MultiWiSE) metrics. The MultiWiSE metrics characterize an individual's episodic exposure to WFS PM<sub>2.5</sub> over the duration of the provided multiyear exposure window. Using PM<sub>2.5</sub> estimates from CanOSSEM, the dashboard can be used to generate PM<sub>2.5</sub> exposure profiles and the MultiWiSE metrics for multiple individuals residing in Canada for any period between 2010–2023. An overview of the required input to the dashboard can be found below in 'Usage', and an overview of the provided outputs can be found in 'Outputs.' Additional details on the dashboard can be found in the README.</p>
+<p>This dashboard uses information on individual-level residential histories (6-character postal codes) and defined exposure windows to calculate the 12 Multiyear Wildfire Smoke Exposure (MultiWiSE) metrics, which characterize an individual’s episodic exposure to wildfire smoke (WFS) PM<sub>2.5</sub>. The dashboard can be used to generate PM<sub>2.5</sub> exposure profiles and the MultiWiSE metrics for multiple individuals residing in Canada for any period between 2010-2023. Details on the required inputs to the dashboard can be found below in ‘Usage’, and details on the outputs provided by the dashboard can be found below in ‘Outputs.’ Additional details on the dashboard can be found in the README.</p>
 "),
           
           tags$h4(HTML("<b>Usage</b>")),
@@ -1494,11 +1424,10 @@ ui <- navbarPage(
           tags$ol(
             tags$li(HTML("<strong>12 MultiWiSE metrics</strong> and five additional variables.")),
             tags$li(HTML(paste0(
-              "Three figures of <strong>PM<sub>2.5</sub> exposure profiles</strong>:",
+              "Two figures of <strong>PM<sub>2.5</sub> exposure profiles</strong>:",
               tags$ul(
                 tags$li(HTML("Cumulative PM<sub>2.5</sub> exposure, separated into total, WFS, and non-WFS components.")),
-                tags$li(HTML("Weekly average total, WFS, and non-WFS PM<sub>2.5</sub> concentrations, with identification of WFS episodes and severe WFS episodes.")),
-                tags$li(HTML("Distribution of the weekly sum of total PM<sub>2.5</sub> exposure, with indication of the range and median used to identify the counterfactual weekly value."))
+                tags$li(HTML("Weekly average total, WFS, and non-WFS PM<sub>2.5</sub> concentrations, with identification of WFS episodes and severe WFS episodes."))
               )
             ))),
             tags$li(HTML("<strong>Weekly PM<sub>2.5</strong> estimates</strong> (total, WFS, and non-WFS PM<sub>2.5</sub> and WFS episodes).")),
@@ -1534,7 +1463,7 @@ ui <- navbarPage(
               tags$a(
                 id    = "dl_all_zip_about",
                 class    = "btn btn-primary btn-lg w-100",
-                href  = "README_111325.pdf",
+                href  = "README_021026.pdf",
                 download = "MultiWiSE_Canada_README.pdf",
                 target = "_blank",
                 HTML("<b>Download README (PDF)</b>")
@@ -1561,8 +1490,8 @@ server <- function(input, output, session) {
     last_run_dir = NULL,
     res_valid = FALSE,
     exp_valid = FALSE,
-    files_ready_popup_shown = FALSE,   # NEW: prevent duplicate 'Done' popup
-    # --- NEW: store parsed frames and cap flag for upload-time gating ---
+    files_ready_popup_shown = FALSE,   # prevent duplicate 'Done' popup
+    # --- store parsed frames and cap flag for upload-time gating ---
     res_df = NULL,
     exp_df = NULL,
     too_many_ids = FALSE
@@ -1630,7 +1559,7 @@ server <- function(input, output, session) {
       shinyjs::addClass("warn_badge", "bg-secondary")
     }
   }
-  # --- UPDATED: require not-over-cap to enable the button ---
+  # --- require not-over-cap to enable the button ---
   update_ready_state <- function() {
     v$file_ok <- isTRUE(v$res_valid) && isTRUE(v$exp_valid) && !isTRUE(v$too_many_ids)
     if (v$file_ok) {
@@ -1645,7 +1574,7 @@ server <- function(input, output, session) {
       v$files_ready_popup_shown <- FALSE
     }
   }
-  # --- NEW: centralized cap-block UI feedback used at upload + run time ---
+  # --- centralized cap-block UI feedback used at upload + run time ---
   # NOTE: No individuals cap for running dashboard locally
   # block_id_cap <- function(n, limit = MAX_UNIQUE_INDIVIDUALS) {
   #   msg_inline <- sprintf(
@@ -1654,10 +1583,6 @@ server <- function(input, output, session) {
   #   )
   #   output$res_size_error <- renderUI(make_inline_error(msg_inline))
   #   output$exp_size_error <- renderUI(make_inline_error(msg_inline))
-  #   # output$run_alert <- renderUI(make_alert(
-  #   #   sprintf("Unable to process data. %s", msg_inline),
-  #   #   title = "Too many individuals"
-  #   # ))
   #   v$too_many_ids <- TRUE
   #   shinyjs::disable("run_analysis")
   #   output$status_line <- renderText("")
@@ -1786,7 +1711,7 @@ server <- function(input, output, session) {
     #   return(invisible())
     # }
     
-    # --- ADDED: show 'processing' if both choosers have a selection ---
+    # --- show 'processing' if both choosers have a selection ---
     if (!is.null(input$res_file) && !is.null(input$exp_file)) {
       show_upload("Files are being processed, hang tight...")
     } else {
@@ -1800,11 +1725,11 @@ server <- function(input, output, session) {
         file_label    = "Residential History"
       )
       v$res_valid <- TRUE
-      v$res_df <- res_df  # NEW: store for upload-time cap check
+      v$res_df <- res_df  # store for upload-time cap check
       
       # NOTE: No individuals cap for running dashboard locally
       # if (v$exp_valid && !is.null(v$exp_df)) {
-      #   # NEW: union-based cap check at upload time
+      #   # union-based cap check at upload time
       #   ids_union <- union(as.character(v$res_df$IndividualID), as.character(v$exp_df$IndividualID))
       #   n_ids <- sum(!is.na(ids_union))
       #   if (n_ids > MAX_UNIQUE_INDIVIDUALS) {
@@ -1850,7 +1775,7 @@ server <- function(input, output, session) {
     #   return(invisible())
     # }
     
-    # --- ADDED: show 'processing' if both choosers have a selection ---
+    # --- show 'processing' if both choosers have a selection ---
     if (!is.null(input$res_file) && !is.null(input$exp_file)) {
       show_upload("Files are being processed, hang tight...")
     } else {
@@ -1864,11 +1789,11 @@ server <- function(input, output, session) {
         file_label    = "Exposure Window"
       )
       v$exp_valid <- TRUE
-      v$exp_df <- exp_df  # NEW: store for upload-time cap check
+      v$exp_df <- exp_df  # store for upload-time cap check
       
       # NOTE: No individuals cap for running dashboard locally
       # if (v$res_valid && !is.null(v$res_df)) {
-      #   # NEW: union-based cap check at upload time
+      #   # union-based cap check at upload time
       #   ids_union <- union(as.character(v$res_df$IndividualID), as.character(v$exp_df$IndividualID))
       #   n_ids <- sum(!is.na(ids_union))
       #   if (n_ids > MAX_UNIQUE_INDIVIDUALS) {
@@ -1983,7 +1908,7 @@ server <- function(input, output, session) {
         ids_all <- ids_all[order(ids_all)]
         n <- length(ids_all); if (n == 0) stop("No IndividualID values detected after merging files.", call. = FALSE)
         
-        # ---- NEW: unique-individuals hard cap (replaced with union-based count) ----
+        # ---- unique-individuals hard cap (replaced with union-based count) ----
         # NOTE: No individuals cap for running dashboard locally
         # res_ids_all <- unique(as.character(res_df$IndividualID))
         # exp_ids_all <- unique(as.character(exp_df$IndividualID))
@@ -2129,12 +2054,10 @@ server <- function(input, output, session) {
         req(length(v$ids) > 0, input$sel_id, input$profile_type)
         df <- v$data_by_id[[input$sel_id]]; req(!is.null(df))
         if (input$profile_type == "cumulative") {
-          print(fn_plot_cumulative_sum_by_year(df))
+          fn_plot_cumulative_sum_by_year(df)
         } else if (input$profile_type == "weekly_avg") {
-          print(fn_plot_time_series_weekly_mean(df))
-        } else {
-          print(fn_plot_histogram(df))
-        }
+          fn_plot_time_series_weekly_mean(df)
+        } 
       }, res = 120)
       
       shinyjs::removeClass("results_wrap", "muted")
@@ -2176,16 +2099,20 @@ server <- function(input, output, session) {
       req(input$sel_id, v$data_by_id[[input$sel_id]])
       g <- {
         df <- v$data_by_id[[input$sel_id]]
-        p1 <- fn_plot_cumulative_sum_by_year(df)
-        p2 <- fn_plot_time_series_weekly_mean(df)
-        p3 <- fn_plot_histogram(df)
-        (p1 / p2 / p3) +
+        p1 <- fn_plot_cumulative_sum_by_year(df) + theme(axis.title = ggplot2::element_text(size = 20), 
+                                                         axis.text = ggplot2::element_text(size = 16), 
+                                                         legend.text = ggplot2::element_text(size = 18))
+        p2 <- fn_plot_time_series_weekly_mean(df) + theme(axis.title = ggplot2::element_text(size = 20), 
+                                                         axis.text = ggplot2::element_text(size = 16), 
+                                                         legend.text = ggplot2::element_text(size = 18))
+        (p1 / p2) +
           patchwork::plot_annotation(
             title = input$sel_id,
-            theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 20, face = "bold", hjust = 0.5))
+            theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 26, face = "bold", hjust = 0.5)
+                                   )
           )
       }
-      ggplot2::ggsave(filename = file, plot = g, width = 14, height = 28, dpi = 300)
+      ggplot2::ggsave(filename = file, plot = g, width = 14, height = 19, dpi = 300)
     }
   )
   
