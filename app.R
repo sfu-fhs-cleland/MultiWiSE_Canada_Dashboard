@@ -697,10 +697,10 @@ fn_plot_cumulative_sum_by_year <- function(df, y_limits = NULL, line_thin = PLOT
 
 fn_plot_time_series_weekly_mean <- function(df, y_limits = NULL,
                                             line_thin = PLOT_LINE_THIN,
-                                            alpha_norm = 0.15,
+                                            alpha_norm = 0.20,
                                             alpha_severe = 0.20,
-                                            fill_norm = "orange",
-                                            fill_severe = "red3") {
+                                            fill_norm = "khaki2",
+                                            fill_severe = "orange2") {
   
   df_plot <- df %>% dplyr::mutate(
     wfs     = dplyr::coalesce(weekly_wfs_pm25_avg_i,     0),
@@ -741,7 +741,7 @@ fn_plot_time_series_weekly_mean <- function(df, y_limits = NULL,
                        ggplot2::aes(x = epiweek_start_date, y = wfs,     color = "WFS"),     linewidth = 0.9) 
   
   if (sum(df_plot$severe_episode_id > 0) || sum(df_plot$episode_id > 0)) {
-    plot <- plot + ggplot2::scale_fill_manual(values = c("Episode" = "orange", "Severe episode" = "red3"),
+    plot <- plot + ggplot2::scale_fill_manual(values = c("Episode" = fill_norm, "Severe episode" = fill_severe),
                                               name = NULL,
                                               guide = ggplot2::guide_legend(override.aes = list(alpha = 0.4))) 
   }
