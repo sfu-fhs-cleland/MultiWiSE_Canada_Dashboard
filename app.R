@@ -386,7 +386,7 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     weekly_non_wfs_pm25_sum_i = sum(partial_non_wfs_weekly_sum_pm25, na.rm = TRUE),
     counterfactual = sum(partial_counterfactual, na.rm = TRUE),
     n_days            = sum(partial_n_days,          na.rm = TRUE),
-    PostalCode        = PostalCode[which.max(partial_n_days)],
+    PostalCode        = ifelse(uniqueN(PostalCode) > 1 & sum(partial_n_days,na.rm = TRUE) > 0, PostalCode[which.max(partial_n_days)], PostalCode),
     num_PCs        = uniqueN(PostalCode)
   ), by = .(epiweek_index, epiweek_start_date, epiweek_end_date)][order(epiweek_start_date)]
   
@@ -394,9 +394,7 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   weekly_exposure[, weekly_non_wfs_pm25_avg_i := weekly_non_wfs_pm25_sum_i / n_days]
   weekly_exposure[, weekly_wfs_pm25_sum_i := weekly_pm25_sum_i - weekly_non_wfs_pm25_sum_i]
   weekly_exposure[, weekly_wfs_pm25_avg_i := weekly_pm25_avg_i - weekly_non_wfs_pm25_avg_i]
-  weekly_exposure[, is_smoke_impacted := ifelse(weekly_wfs_pm25_avg_i > 0, 1, 0)]
-  
-  weekly_exposure <- weekly_exposure[n_days > 0]
+  weekly_exposure[, is_smoke_impacted := ifelse(!is.na(weekly_wfs_pm25_avg_i) & weekly_wfs_pm25_avg_i > 0, 1, 0)]
   
   if (nrow(weekly_exposure) > 0 && weekly_exposure$n_days[1] < 7)
     weekly_exposure <- weekly_exposure[-1]
@@ -782,11 +780,9 @@ fn_run_individual_analysis <- function(res_hist,
     exposure_window_end       = end_exposure,
     dropbox_token_file        = token_path
   )
-  
-  # trajectory <- fn_build_counterfactual_trajectory(weekly_exposure)
-  
+    
   trajectory[, episode_id := fn_identify_smoke_episodes(
-    is_smoke_impacted          = as.integer(weekly_wfs_pm25_avg_i > 0),
+    is_smoke_impacted          = is_smoke_impacted,
     cont_week                  = week_sequence,
     weekly_sum_wfs_pm25_values = weekly_wfs_pm25_sum_i,
     episode_threshold          = 0,
@@ -796,7 +792,7 @@ fn_run_individual_analysis <- function(res_hist,
   )]
   
   trajectory[, severe_episode_id := fn_identify_smoke_episodes(
-    is_smoke_impacted          = as.integer(weekly_wfs_pm25_avg_i > 0),
+    is_smoke_impacted          = is_smoke_impacted,
     cont_week                  = week_sequence,
     weekly_sum_wfs_pm25_values = weekly_wfs_pm25_sum_i,
     episode_threshold          = 250,
