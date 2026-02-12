@@ -395,10 +395,12 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   weekly_exposure[, weekly_wfs_pm25_sum_i := weekly_pm25_sum_i - weekly_non_wfs_pm25_sum_i]
   weekly_exposure[, weekly_wfs_pm25_avg_i := weekly_pm25_avg_i - weekly_non_wfs_pm25_avg_i]
   weekly_exposure[, is_smoke_impacted := ifelse(!is.na(weekly_wfs_pm25_avg_i) & weekly_wfs_pm25_avg_i > 0, 1, 0)]
+
+  weekly_exposure$overlap_days <- as.numeric((weekly_exposure$epiweek_end_date - weekly_exposure$epiweek_start_date)+1)
   
-  if (nrow(weekly_exposure) > 0 && weekly_exposure$n_days[1] < 7)
+  if (nrow(weekly_exposure) > 0 && weekly_exposure$overlap_days[1] < 7)
     weekly_exposure <- weekly_exposure[-1]
-  if (nrow(weekly_exposure) > 0 && weekly_exposure$n_days[nrow(weekly_exposure)] < 7)
+  if (nrow(weekly_exposure) > 0 && weekly_exposure$overlap_days[nrow(weekly_exposure)] < 7)
     weekly_exposure <- weekly_exposure[-nrow(weekly_exposure)]
   
   if (nrow(weekly_exposure) > 0) {
