@@ -1,5 +1,5 @@
 # MultiWiSE Canada Dashboard
-# Updated Feb 10, 2026
+# Updated Feb 12, 2026
 
 #### Configuration and setup ####
 options(shiny.maxRequestSize = 5000e6)  # NOTE: Using 5 GB upload cap for dashboard to run locally
@@ -337,7 +337,7 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   }
   
   # ---- 4. Build partial-week table and aggregate to weekly_exposure ----------
-  pw_list <- list(); ctr <- 1L
+  pw_list <- list(); ctr <- 1L; counterfactuals <- vector(mode = "numeric", length = nrow(res_dt))
   
   for (i in seq_len(nrow(res_dt))) {
     pc       <- res_dt$PostalCode[i]
@@ -348,10 +348,19 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     overlap_end   <- min(pc_end,   exposure_window_end)
     if (overlap_end < overlap_start) next
     
-    dt <- fn_get_postal_code_data(pc)#, token_path = dropbox_token_file)
+    dt <- fn_get_postal_code_data(pc, token_path = dropbox_token_file)
     
     dt[, c("epiweek_start_date","epiweek_end_date") :=
          lapply(.SD, as.Date), .SDcols = c("epiweek_start_date","epiweek_end_date")]
+    
+    counterfactuals[i] <- (dt %>%
+                             filter(!is.na(modified_z),
+                                    dplyr::between(modified_z, -2, 2),
+                                    n_days == 7) %>%
+                             pull(pm25_weekly_sum) %>% median(na.rm = TRUE) %>% replace_na(0))/7
+    
+    print(paste0('For PC: ', pc, ' the counterfactual is: ',counterfactuals[i] ,
+                 ' and there is ', nrow(dt), ' rows.'))
     
     dt <- dt[epiweek_end_date >= overlap_start & epiweek_start_date <= overlap_end]
     if (nrow(dt) == 0) next
@@ -366,16 +375,16 @@ fn_build_individual_exposure_history <- function(residential_history_table,
     dt[, partial_pm25_weekly_sum := pm25_weekly_sum * fraction_of_week]
     dt[, partial_non_wfs_weekly_sum_pm25 := non_wfs_weekly_sum_pm25 * fraction_of_week]
     dt[, partial_n_days          := n_days * fraction_of_week]
-    dt[, partial_counterfactual          :=  unique(dt[dt$wfs_weekly_sum_pm25 > 0,]$non_wfs_weekly_avg_pm25) * fraction_of_week]
     
     pw_list[[ctr]] <- dt[, .(
       epiweek_index, epiweek_start_date, epiweek_end_date,
       partial_pm25_weekly_sum,
       partial_non_wfs_weekly_sum_pm25,
-      partial_n_days, partial_counterfactual, PostalCode
+      partial_n_days, PostalCode
     )]
     ctr <- ctr + 1L
   }
+  
   
   if (ctr == 1L) stop("No overlapping data found for this individual's history.", call. = FALSE)
   
@@ -384,23 +393,30 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   weekly_exposure <- combine_partial[, .(
     weekly_pm25_sum_i = sum(partial_pm25_weekly_sum, na.rm = TRUE),
     weekly_non_wfs_pm25_sum_i = sum(partial_non_wfs_weekly_sum_pm25, na.rm = TRUE),
-    counterfactual = sum(partial_counterfactual, na.rm = TRUE),
     n_days            = sum(partial_n_days,          na.rm = TRUE),
     PostalCode        = ifelse(uniqueN(PostalCode) > 1 & sum(partial_n_days,na.rm = TRUE) > 0, PostalCode[which.max(partial_n_days)], PostalCode),
     num_PCs        = uniqueN(PostalCode)
   ), by = .(epiweek_index, epiweek_start_date, epiweek_end_date)][order(epiweek_start_date)]
   
   weekly_exposure[, weekly_pm25_avg_i := weekly_pm25_sum_i / n_days]
-  weekly_exposure[, weekly_non_wfs_pm25_avg_i := weekly_non_wfs_pm25_sum_i / n_days]
+  
+  weekly_exposure[, weekly_non_wfs_pm25_avg_i := ifelse(weekly_non_wfs_pm25_sum_i == weekly_pm25_sum_i,
+                                                        weekly_non_wfs_pm25_sum_i / n_days,
+                                                        weekly_non_wfs_pm25_sum_i / 7)]
+  
+  weekly_exposure[, weekly_non_wfs_pm25_sum_i := ifelse(weekly_non_wfs_pm25_sum_i == weekly_pm25_sum_i,
+                                                        weekly_non_wfs_pm25_sum_i,
+                                                        weekly_non_wfs_pm25_sum_i * (n_days/7))]
+  
   weekly_exposure[, weekly_wfs_pm25_sum_i := weekly_pm25_sum_i - weekly_non_wfs_pm25_sum_i]
-  weekly_exposure[, weekly_wfs_pm25_avg_i := weekly_pm25_avg_i - weekly_non_wfs_pm25_avg_i]
+  weekly_exposure[, weekly_wfs_pm25_avg_i := weekly_wfs_pm25_sum_i / n_days]
   weekly_exposure[, is_smoke_impacted := ifelse(!is.na(weekly_wfs_pm25_avg_i) & weekly_wfs_pm25_avg_i > 0, 1, 0)]
-
+  
   weekly_exposure$overlap_days <- as.numeric((weekly_exposure$epiweek_end_date - weekly_exposure$epiweek_start_date)+1)
   
-  if (nrow(weekly_exposure) > 0 && weekly_exposure$overlap_days[1] < 7)
+  if (nrow(weekly_exposure) > 0 && weekly_exposure$epiweek_start_date[1] < overlap_start)
     weekly_exposure <- weekly_exposure[-1]
-  if (nrow(weekly_exposure) > 0 && weekly_exposure$overlap_days[nrow(weekly_exposure)] < 7)
+  if (nrow(weekly_exposure) > 0 && weekly_exposure$epiweek_end_date[nrow(weekly_exposure)] > overlap_end)
     weekly_exposure <- weekly_exposure[-nrow(weekly_exposure)]
   
   if (nrow(weekly_exposure) > 0) {
@@ -415,7 +431,7 @@ fn_build_individual_exposure_history <- function(residential_history_table,
   weekly_exposure[, cumulative_non_wfs_pm25_sum_individual := cumsum(weekly_non_wfs_pm25_sum_i)]
   weekly_exposure[, cumulative_total_pm25_sum_individual := cumsum(weekly_pm25_sum_i)]
   
-  return(weekly_exposure[])
+  return(list(weekly_exposure,counterfactuals))
 }
 
 # (Token reading is handled within helpers; no global read check here)
@@ -575,6 +591,7 @@ fn_identify_smoke_episodes <- function(is_smoke_impacted, cont_week,
 
 #### 8  Compute metrics ########################################################
 fn_compute_metrics <- function(df,
+                               counterfactuals,
                                exposure_start,
                                exposure_end,
                                smoke_week_threshold = 0) {
@@ -655,7 +672,7 @@ fn_compute_metrics <- function(df,
     `Average_Total_PM25`        = round(mean(df$weekly_pm25_avg_i, na.rm = TRUE), 2),
     `Cumulative_NonWFS_PM25`    = round(non_wfs_cumul_mg, 2),
     `Average_NonWFS_PM25`       = round(mean(df$weekly_non_wfs_pm25_avg_i, na.rm = TRUE), 2),
-    `Average_Counterfactual_Value` = round(mean(unique(df[df$num_PCs == 1,]$counterfactual)), 2)
+    `Average_Counterfactual_Value` = round(mean(counterfactuals), 2)
   )
   
   dplyr::bind_cols(numbered, extras)
@@ -776,13 +793,16 @@ fn_run_individual_analysis <- function(res_hist,
                                        token_path,
                                        IndividualID) {
   
-  trajectory <- fn_build_individual_exposure_history(
+  output <- fn_build_individual_exposure_history(
     residential_history_table = res_hist,
     exposure_window_start     = start_exposure,
     exposure_window_end       = end_exposure,
     dropbox_token_file        = token_path
   )
-    
+  
+  trajectory <- output[[1]]
+  counterfactuals <- output[[2]]
+  
   trajectory[, episode_id := fn_identify_smoke_episodes(
     is_smoke_impacted          = is_smoke_impacted,
     cont_week                  = week_sequence,
@@ -821,6 +841,7 @@ fn_run_individual_analysis <- function(res_hist,
   
   metrics <- fn_compute_metrics(
     trajectory,
+    counterfactuals,
     exposure_start = start_exposure,
     exposure_end   = end_exposure
   )
