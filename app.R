@@ -359,9 +359,6 @@ fn_build_individual_exposure_history <- function(residential_history_table,
                                     n_days == 7) %>%
                              pull(pm25_weekly_sum) %>% median(na.rm = TRUE) %>% replace_na(0))/7
     
-    print(paste0('For PC: ', pc, ' the counterfactual is: ',counterfactuals[i] ,
-                 ' and there is ', nrow(dt), ' rows.'))
-    
     dt <- dt[epiweek_end_date >= overlap_start & epiweek_start_date <= overlap_end]
     if (nrow(dt) == 0) next
     
