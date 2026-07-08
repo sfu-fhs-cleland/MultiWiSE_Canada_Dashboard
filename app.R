@@ -467,7 +467,7 @@ province_abbr <- c(
   Newfoundland = "NL", NovaScotia = "NS", PrinceEdwardIsland = "PE",
   NewBrunswick = "NB", Quebec = "QC", Ontario = "ON", Manitoba = "MB",
   Saskatchewan = "SK", Alberta = "AB", BritishColumbia = "BC",
-  "NorthwestTerritories-Nunavut" = "NT", Yukon = "YT"
+  "NorthwestTerritories-Nunavut" = "NT-NU", Yukon = "YT"
 )
 
 #### 5  Fetch & load postal-code file from Dropbox ############################
